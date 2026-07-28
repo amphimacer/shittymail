@@ -8,13 +8,16 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@fastify/static": "^10.1.2",
     "dotenv": "^17.4.2",
     "fastify": "^5.10.0",
+    "mailparser": "^3.9.14",
     "nodemailer": "^9.0.3",
     "smtp-server": "^3.19.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/mailparser": "^3.4.6",
     "@types/node": "^26.1.2",
     "@types/nodemailer": "^8.0.1",
     "@types/smtp-server": "^3.5.13",
