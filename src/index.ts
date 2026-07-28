@@ -6,8 +6,9 @@ import { simpleParser } from "mailparser";
 import { z } from "zod";
 import dotenv from "dotenv";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
+import dns from "node:dns/promises";
+import fs from "node:fs";
 
 dotenv.config();
 
@@ -22,6 +23,10 @@ const api_key = process.env.api_key;
 const mail_domain = process.env.mail_domain;
 const smtp_listen_host = process.env.smtp_listen_host;
 const api_listen_host = process.env.api_listen_host;
+const outbound_host = process.env.outbound_host || "";
+const outbound_port = Number(process.env.outbound_port || 25);
+const outbound_user = process.env.outbound_user || "";
+const outbound_password = process.env.outbound_password || "";
 
 if (
     !port ||
@@ -126,16 +131,100 @@ function resolve_auth(authorization: string | undefined) {
     return null;
 }
 
-const transporter = nodemailer.createTransport({
-    host: smtp_host,
-    port: smtp_port,
-    secure: false,
-    ignoreTLS: true,
-    auth: {
-        user: smtp_user,
-        pass: smtp_password,
-    },
-});
+async function resolve_mx(hostname: string) {
+    const records = await dns.resolveMx(hostname);
+    records.sort((a, b) => a.priority - b.priority);
+    if (!records[0]?.exchange) {
+        throw new Error(`no mx records for ${hostname}`);
+    }
+    return records[0].exchange;
+}
+
+function create_outbound_transport(host: string) {
+    return nodemailer.createTransport({
+        host,
+        port: outbound_host ? outbound_port : 25,
+        secure: false,
+        name: domain,
+        tls: {
+            rejectUnauthorized: false,
+        },
+        ...(outbound_host && outbound_user && outbound_password
+            ? {
+                  auth: {
+                      user: outbound_user,
+                      pass: outbound_password,
+                  },
+              }
+            : {}),
+    });
+}
+
+async function deliver_local(
+    from: string,
+    recipients: string[],
+    subject: string,
+    html: string | undefined,
+    text: string | undefined,
+) {
+    for (const recipient of recipients) {
+        store_mail(recipient, {
+            id: randomUUID(),
+            from,
+            to: recipient,
+            subject,
+            text: text || "",
+            html: html || "",
+            date: new Date().toISOString(),
+        });
+    }
+}
+
+async function deliver_remote(
+    from: string,
+    recipients: string[],
+    subject: string,
+    html: string | undefined,
+    text: string | undefined,
+) {
+    if (outbound_host) {
+        const transporter = create_outbound_transport(outbound_host);
+        return transporter.sendMail({
+            from,
+            to: recipients,
+            subject,
+            html,
+            text,
+        });
+    }
+
+    const grouped = new Map<string, string[]>();
+
+    for (const recipient of recipients) {
+        const host = recipient.split("@")[1]?.toLowerCase();
+        if (!host) continue;
+        const list = grouped.get(host) ?? [];
+        list.push(recipient);
+        grouped.set(host, list);
+    }
+
+    let last_id = "";
+
+    for (const [host, group] of grouped.entries()) {
+        const mx = await resolve_mx(host);
+        const transporter = create_outbound_transport(mx);
+        const info = await transporter.sendMail({
+            from,
+            to: group,
+            subject,
+            html,
+            text,
+        });
+        last_id = info.messageId;
+    }
+
+    return { messageId: last_id };
+}
 
 const email_schema = z.object({
     from: z.string().email(),
@@ -315,7 +404,15 @@ app.delete<{ Params: { id: string } }>("/v1/users/:id", async (request, reply) =
     };
 });
 
-app.get("/v1/emails", async (request) => {
+app.get("/v1/emails", async (request, reply) => {
+    if (!resolve_auth(request.headers.authorization)) {
+        return reply.code(401).send({
+            error: {
+                message: "invalid api key",
+            },
+        });
+    }
+
     const query = request.query as { q?: string; status?: string };
     let list = [...sent_mails];
 
@@ -349,6 +446,14 @@ app.get("/v1/emails", async (request) => {
 });
 
 app.get<{ Params: { id: string } }>("/v1/emails/:id", async (request, reply) => {
+    if (!resolve_auth(request.headers.authorization)) {
+        return reply.code(401).send({
+            error: {
+                message: "invalid api key",
+            },
+        });
+    }
+
     const mail = sent_mails.find((item) => item.id === request.params.id);
 
     if (!mail) {
@@ -396,19 +501,30 @@ app.post("/v1/emails", async (request, reply) => {
 
     const recipients = Array.isArray(to) ? to : [to];
     const record_id = randomUUID();
+    const local_recipients = recipients.filter((address) => is_local_address(address));
+    const remote_recipients = recipients.filter((address) => !is_local_address(address));
 
     try {
-        const info = await transporter.sendMail({
-            from,
-            to,
-            subject,
-            html,
-            text,
-        });
+        if (local_recipients.length > 0) {
+            await deliver_local(from, local_recipients, subject, html, text);
+        }
+
+        let message_id = `<${record_id}@${domain}>`;
+
+        if (remote_recipients.length > 0) {
+            const info = await deliver_remote(
+                from,
+                remote_recipients,
+                subject,
+                html,
+                text,
+            );
+            message_id = info.messageId || message_id;
+        }
 
         const record: SentMail = {
             id: record_id,
-            message_id: info.messageId,
+            message_id,
             from,
             to: recipients,
             subject,
@@ -424,7 +540,7 @@ app.post("/v1/emails", async (request, reply) => {
 
         return reply.send({
             id: record.id,
-            message_id: info.messageId,
+            message_id,
             message: "email sent successfully",
         });
     } catch (error) {
@@ -457,7 +573,15 @@ app.post("/v1/emails", async (request, reply) => {
     }
 });
 
-app.get("/v1/received", async (request) => {
+app.get("/v1/received", async (request, reply) => {
+    if (!resolve_auth(request.headers.authorization)) {
+        return reply.code(401).send({
+            error: {
+                message: "invalid api key",
+            },
+        });
+    }
+
     const query = request.query as { q?: string };
     const messages: Array<StoredMail & { index: number }> = [];
 
@@ -504,6 +628,14 @@ app.get("/v1/received", async (request) => {
 });
 
 app.get<{ Params: { id: string } }>("/v1/received/:id", async (request, reply) => {
+    if (!resolve_auth(request.headers.authorization)) {
+        return reply.code(401).send({
+            error: {
+                message: "invalid api key",
+            },
+        });
+    }
+
     for (const inbox of inboxes.values()) {
         const message = inbox.find((item) => item.id === request.params.id);
         if (message) return message;
@@ -610,15 +742,21 @@ app.delete<{ Params: { address: string } }>("/v1/inbox/:address", async (request
     };
 });
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const client_root = path.join(process.cwd(), "client", "dist");
 
-await app.register(fastifyStatic, {
-    root: path.join(__dirname, "client"),
-    wildcard: false,
-});
+if (fs.existsSync(client_root)) {
+    await app.register(fastifyStatic, {
+        root: client_root,
+        wildcard: false,
+    });
+}
 
 app.setNotFoundHandler((request, reply) => {
-    if (request.method === "GET" && !request.url.startsWith("/v1/")) {
+    if (
+        request.method === "GET" &&
+        !request.url.startsWith("/v1/") &&
+        fs.existsSync(path.join(client_root, "index.html"))
+    ) {
         return reply.sendFile("index.html");
     }
 
